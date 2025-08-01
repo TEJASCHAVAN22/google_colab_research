@@ -1,0 +1,145 @@
+# ==========================================================
+# 📌 Runoff Index Analysis using Google Earth Engine in Python
+#     - Monthly Time Series (Chart)
+#     - Annual Map Visualization (geemap)
+# ==========================================================
+
+import ee
+import pandas as pd
+import matplotlib.pyplot as plt
+import geemap
+
+# Initialize Earth Engine
+# Authenticate and initialize Earth Engine
+ee.Authenticate()
+ee.Initialize(project='gee-trial2')
+# -------------------------
+# 1. Define Region of Interest (ROI)
+# -------------------------
+roi = ee.Geometry.Polygon([
+    [
+        [72.58927281167809, 21.840122116608388],
+        [72.58927281167809, 16.656229448263158],
+        [79.13712437417809, 16.656229448263158],
+        [79.13712437417809, 21.840122116608388]
+    ]
+])
+
+# -------------------------
+# 2. Time Range Setup
+# -------------------------
+start_year = 2022
+start_date = '2022-01-01'
+end_date = '2022-12-31'
+
+# -------------------------
+# 3. Function: Monthly Runoff Index Calculation
+# -------------------------
+def get_monthly_runoff_index(year, month):
+    start = ee.Date.fromYMD(year, month, 1)
+    end = start.advance(1, 'month')
+
+    # CHIRPS Rainfall
+    precip = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY") \
+        .filterDate(start, end).filterBounds(roi).sum() \
+        .rename('Precip').clip(roi)
+
+    # GLDAS Surface Runoff (Qs_acc)
+    runoff = ee.ImageCollection("NASA/GLDAS/V021/NOAH/G025/T3H") \
+        .filterDate(start, end).filterBounds(roi) \
+        .select('Qs_acc').sum() \
+        .rename('Runoff').clip(roi)
+
+    # Runoff Index
+    runoff_index = runoff.divide(precip).rename('Runoff_Index')
+
+    # Mean value for the region
+    mean = runoff_index.reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=roi,
+        scale=5000,
+        maxPixels=1e13
+    ).get('Runoff_Index')
+
+    return ee.Feature(None, {
+        'date': start.format('YYYY-MM'),
+        'Runoff_Index': mean
+    })
+
+# -------------------------
+# 4. Create Monthly FeatureCollection
+# -------------------------
+months = list(range(1, 13))
+monthly_features = [get_monthly_runoff_index(start_year, m) for m in months]
+monthly_fc = ee.FeatureCollection(monthly_features)
+
+# -------------------------
+# 5. Convert to Pandas DataFrame
+# -------------------------
+monthly_data = monthly_fc.getInfo()
+records = [
+    {
+        'date': f['properties']['date'],
+        'Runoff_Index': f['properties']['Runoff_Index']
+    }
+    for f in monthly_data['features']
+]
+
+df = pd.DataFrame(records)
+df['date'] = pd.to_datetime(df['date'])
+df.set_index('date', inplace=True)
+
+# -------------------------
+# 6. Plot Time Series Chart
+# -------------------------
+plt.figure(figsize=(10, 5))
+plt.plot(df.index, df['Runoff_Index'], marker='o', color='blue')
+plt.title('Monthly Runoff Index (2022)')
+plt.ylabel('Runoff Index')
+plt.xlabel('Month')
+plt.grid(True)
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+# -------------------------
+# 7. Annual Precipitation, Runoff, and Runoff Index Image Layers
+# -------------------------
+# CHIRPS Total Precipitation (mm)
+precip_total = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY") \
+    .filterDate(start_date, end_date) \
+    .filterBounds(roi) \
+    .sum().rename('Precip').clip(roi)
+
+# GLDAS Total Surface Runoff (mm)
+runoff_total = ee.ImageCollection("NASA/GLDAS/V021/NOAH/G025/T3H") \
+    .filterDate(start_date, end_date) \
+    .filterBounds(roi) \
+    .select('Qs_acc') \
+    .sum().rename('Runoff').clip(roi)
+
+# Annual Runoff Index
+runoff_index_img = runoff_total.divide(precip_total).rename('Runoff_Index')
+
+# -------------------------
+# 8. Interactive Map Visualization using geemap
+# -------------------------
+Map = geemap.Map(center=[19.2, 75.9], zoom=6)
+
+Map.addLayer(precip_total, {
+    'min': 0, 'max': 2000,
+    'palette': ['white', 'lightblue', 'green']
+}, 'Total Precipitation (mm)')
+
+Map.addLayer(runoff_total, {
+    'min': 0, 'max': 500,
+    'palette': ['white', 'yellow', 'red']
+}, 'Total Runoff (mm)')
+
+Map.addLayer(runoff_index_img, {
+    'min': 0, 'max': 1,
+    'palette': ['white', 'blue', 'darkblue']
+}, 'Runoff Index (Annual)')
+
+Map.addLayer(roi, {'color': 'black'}, 'ROI Boundary')
+Map
