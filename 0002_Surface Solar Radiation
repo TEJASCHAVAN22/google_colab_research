@@ -1,0 +1,84 @@
+import ee
+import geemap
+import datetime
+import matplotlib.pyplot as plt
+
+# Authenticate and initialize Earth Engine
+ee.Authenticate()
+ee.Initialize(project='gee-trial2')
+
+# 1. Load ROI
+roi = ee.FeatureCollection("projects/gee-trial2/assets/Shapfile/ShapfileShapfile_Chandrapur")
+
+# 2. Set date range
+start_date = '2024-01-01'
+end_date = '2024-12-31'
+
+# 3. Load ERA5-Land Hourly Dataset
+era5 = ee.ImageCollection('ECMWF/ERA5_LAND/HOURLY') \
+    .filterDate(start_date, end_date) \
+    .select('surface_solar_radiation_downwards')
+
+# 4. Create daily images from hourly
+n_days = (datetime.datetime.strptime(end_date, "%Y-%m-%d") -
+          datetime.datetime.strptime(start_date, "%Y-%m-%d")).days
+
+def create_daily_sum(day_offset):
+    day = ee.Date(start_date).advance(day_offset, 'day')
+    next_day = day.advance(1, 'day')
+    daily_sum = era5.filterDate(day, next_day).sum()
+    return daily_sum.set('system:time_start', day.millis())
+
+daily_list = ee.List.sequence(0, n_days - 1).map(lambda d: create_daily_sum(ee.Number(d)))
+daily_collection = ee.ImageCollection(daily_list)
+
+# 5. Convert J/m² to kWh/m²
+daily_kWh = daily_collection.map(lambda img: img.multiply(1 / 3600000)
+                                 .copyProperties(img, img.propertyNames()))
+
+# 6. Calculate mean radiation image
+mean_radiation = daily_kWh.mean()
+
+# 7. Plot time series at a sample point
+point = ee.Geometry.Point([79.3, 19.9])  # Sample point in Chandrapur
+
+# Extract daily values to a list
+def extract_time_series(ic, point, scale):
+    dates = []
+    values = []
+
+    ic_list = ic.toList(ic.size())
+    for i in range(ic.size().getInfo()):
+        img = ee.Image(ic_list.get(i))
+        date = ee.Date(img.get('system:time_start')).format('YYYY-MM-dd').getInfo()
+        val = img.reduceRegion(ee.Reducer.mean(), point, scale).getInfo()
+        v = val.get('surface_solar_radiation_downwards')
+        if v is not None:
+            values.append(float(v))
+            dates.append(date)
+    return dates, values
+
+dates, values = extract_time_series(daily_kWh, point, 1000)
+
+# Plot using matplotlib
+plt.figure(figsize=(12,5))
+plt.plot(dates, values, color='orange', linewidth=1.5)
+plt.xlabel('Date')
+plt.ylabel('Solar Radiation (kWh/m²/day)')
+plt.title('Daily Solar Radiation at Sample Point (2024)')
+plt.xticks(rotation=45)
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# 8. Display final mean radiation layer using folium map
+Map = geemap.Map(center=[19.9, 79.3], zoom=8)
+vis_params = {
+    'min': 20,
+    'max': 150,
+    'palette': ['blue', 'cyan', 'yellow', 'orange', 'red']
+}
+Map.addLayer(mean_radiation.clip(roi), vis_params, "Mean Solar Radiation 2024")
+Map.addLayer(roi, {}, "ROI")
+Map
+
