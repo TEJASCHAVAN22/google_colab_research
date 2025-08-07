@@ -1,0 +1,81 @@
+# --- Dependencies ---
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+
+# --- Use the existing NDVI stats data (2000–2024) ---
+X = stats[['year']]
+y = stats['mean_ndvi']
+
+# === RANDOM FOREST PREDICTION ===
+model_rf = RandomForestRegressor(n_estimators=100, random_state=42)
+model_rf.fit(X, y)
+
+future_years = pd.DataFrame({'year': list(range(2025, 2031))})
+rf_predictions = model_rf.predict(future_years)
+
+rf_forecast_df = future_years.copy()
+rf_forecast_df['RF_NDVI'] = rf_predictions
+
+# === LSTM PREDICTION ===
+data = stats[['mean_ndvi']].values
+scaler = MinMaxScaler()
+data_scaled = scaler.fit_transform(data)
+
+def create_lagged_data(data, look_back=3):
+    X, y = [], []
+    for i in range(len(data) - look_back):
+        X.append(data[i:(i + look_back), 0])
+        y.append(data[i + look_back, 0])
+    return np.array(X), np.array(y)
+
+look_back = 3
+X_lstm, y_lstm = create_lagged_data(data_scaled, look_back)
+X_lstm = X_lstm.reshape((X_lstm.shape[0], look_back, 1))
+
+model_lstm = Sequential([
+    LSTM(50, input_shape=(look_back, 1)),
+    Dense(1)
+])
+model_lstm.compile(optimizer='adam', loss='mse')
+model_lstm.fit(X_lstm, y_lstm, epochs=100, batch_size=1, verbose=0)
+
+# Forecast future
+forecast_scaled = data_scaled[-look_back:].flatten().tolist()
+lstm_preds_scaled = []
+
+for _ in range(6):  # 2025–2030
+    x_input = np.array(forecast_scaled[-look_back:]).reshape((1, look_back, 1))
+    next_val = model_lstm.predict(x_input, verbose=0)[0][0]
+    forecast_scaled.append(next_val)
+    lstm_preds_scaled.append(next_val)
+
+lstm_predictions = scaler.inverse_transform(np.array(lstm_preds_scaled).reshape(-1, 1)).flatten()
+
+lstm_forecast_df = pd.DataFrame({
+    'year': list(range(2025, 2031)),
+    'LSTM_NDVI': lstm_predictions
+})
+
+# === COMBINE ALL FORECASTS ===
+combined_forecast = pd.merge(rf_forecast_df, lstm_forecast_df, on='year')
+
+# === PLOT ALL TOGETHER ===
+plt.figure(figsize=(10, 5))
+plt.plot(stats['year'], stats['mean_ndvi'], marker='o', label='Observed NDVI (2000–2024)')
+plt.plot(combined_forecast['year'], combined_forecast['RF_NDVI'], marker='x', label='RF Forecast (2025–2030)')
+plt.plot(combined_forecast['year'], combined_forecast['LSTM_NDVI'], marker='s', label='LSTM Forecast (2025–2030)')
+plt.title("NDVI Forecast (RF & LSTM Models)")
+plt.xlabel("Year")
+plt.ylabel("Mean NDVI")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# === EXPORT TO CSV ===
+combined_forecast.to_csv("ndvi_forecasts_2025_2030.csv", index=False)
