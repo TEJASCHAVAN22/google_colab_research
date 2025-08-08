@@ -1,0 +1,74 @@
+import ee
+import geemap
+import matplotlib.pyplot as plt
+import pandas as pd
+
+# Authenticate and initialize GEE
+ee.Authenticate()
+ee.Initialize(project='gee-trial2')
+
+# Load Area of Interest
+aoi = ee.FeatureCollection('projects/gee-trial2/assets/Shapfile/WMH_Distric')
+
+# Load Sentinel-5P SO2 dataset
+so2 = (ee.ImageCollection('COPERNICUS/S5P/NRTI/L3_SO2')
+       .select('SO2_column_number_density')
+       .filterDate('2025-01-01', '2025-08-01')
+       .filterBounds(aoi))
+
+# Calculate mean SO2 image
+so2_mean = so2.mean().clip(aoi)
+
+# Visualization parameters
+vis_params = {
+    'min': 0.00005,
+    'max': 0.0005,
+    'palette': ['black', 'blue', 'purple', 'cyan', 'green', 'yellow', 'red']
+}
+
+# Create interactive map
+Map = geemap.Map(center=[20.5, 78.9], zoom=5)
+Map.addLayer(so2_mean, vis_params, 'Mean SO₂ (mol/m²)')
+Map.addLayerControl()
+Map
+
+# -------------------------------------------
+# Time-Series Extraction and Plotting
+# -------------------------------------------
+
+# Function to extract mean SO2 values over AOI
+def extract_so2_timeseries(collection, region, scale=1000):
+    def reduce_image(image):
+        stats = image.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=region,
+            scale=scale,
+            maxPixels=1e9
+        )
+        return ee.Feature(None, {
+            'date': image.date().format('YYYY-MM-dd'),
+            'SO2': stats.get('SO2_column_number_density')
+        })
+
+    reduced = collection.map(reduce_image)
+    return reduced
+
+# Apply function and convert to pandas dataframe
+so2_chart_fc = ee.FeatureCollection(extract_so2_timeseries(so2, aoi.geometry()))
+so2_dict = geemap.ee_to_df(so2_chart_fc)
+
+# Drop rows with None values
+so2_dict = so2_dict.dropna()
+
+# Convert date column
+so2_dict['date'] = pd.to_datetime(so2_dict['date'])
+
+# Plot the chart
+plt.figure(figsize=(10, 5))
+plt.plot(so2_dict['date'], so2_dict['SO2'], marker='o', color='red', linewidth=2)
+plt.title('SO₂ Monitoring Over Time')
+plt.xlabel('Date')
+plt.ylabel('SO₂ (mol/m²)')
+plt.grid(True)
+plt.tight_layout()
+plt.show()
