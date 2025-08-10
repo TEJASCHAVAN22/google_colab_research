@@ -1,0 +1,244 @@
+import ee
+import geemap
+import pandas as pd
+import numpy as np
+from datetime import datetime
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+import xgboost as xgb
+import joblib
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# ---------------------- INITIALIZE EE ----------------------
+print("Authenticating Earth Engine...")
+try:
+    ee.Authenticate()
+    print("Authentication successful.")
+except Exception as e:
+    print(f"Earth Engine authentication failed: {e}")
+    # Exit or handle the error appropriately if authentication fails
+    # For now, we will let the script continue but subsequent EE calls will fail.
+
+print("Initializing Earth Engine...")
+try:
+    ee.Initialize(project='gee-trial2')
+    print("Earth Engine initialized.")
+except Exception as e:
+    print(f"Earth Engine initialization failed: {e}")
+    # Exit or handle the error appropriately if initialization fails
+    # For now, we will let the script continue but subsequent EE calls will fail.
+
+
+# ---------------------- USER PARAMETERS ----------------------
+AOI = ee.Geometry.Polygon([
+    [[76.0, 18.0],[76.0, 17.0],[77.5, 17.0],[77.5, 18.0]]
+])
+START_DATE = '2015-01-01'
+END_DATE = '2024-12-31'
+BASELINE_START = '2001-01-01'
+BASELINE_END = '2014-12-31'
+# Set data collection start date to include the baseline period
+DATA_COLLECTION_START = BASELINE_START
+DATA_COLLECTION_END = END_DATE
+
+SCALE_NDVI = 500
+SCALE_PRECIP = 5000
+OUTPUT_CSV = 'drought_timeseries_dataset.csv'
+MODEL_PATH = 'xgb_drought_model.joblib'
+VCI_DROUGHT_THRESHOLD = 0.4
+
+
+# ---------------------- HELPERS ----------------------
+def scale_modis_ndvi(img):
+    return img.select('NDVI').multiply(0.0001).copyProperties(img, ['system:time_start'])
+
+def list_month_starts(start, end):
+    start_date = ee.Date(start)
+    end_date = ee.Date(end)
+    months = []
+    cur = start_date
+    while cur.millis().lt(end_date.millis()).getInfo():
+        month_str = cur.format('YYYY-MM-01').getInfo()
+        months.append(month_str)
+        cur = cur.advance(1, 'month')
+    return months
+
+# ---------------------- DATA COLLECTION ----------------------
+print('Loading collections...')
+modis_ndvi = ee.ImageCollection('MODIS/006/MOD13Q1') \
+    .filterBounds(AOI).filterDate(DATA_COLLECTION_START, DATA_COLLECTION_END) \
+    .map(scale_modis_ndvi)
+
+chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY') \
+    .select('precipitation').filterBounds(AOI).filterDate(DATA_COLLECTION_START, DATA_COLLECTION_END)
+
+soil_moist_coll = None  # placeholder if soil moisture data available
+
+# ---------------------- MONTHLY AGGREGATION ----------------------
+print('Building monthly time series and spatial data...')
+month_starts = list_month_starts(DATA_COLLECTION_START, DATA_COLLECTION_END)
+records = []
+monthly_spatial_data = {} # Dictionary to store monthly spatial images
+
+for m in month_starts:
+    start = ee.Date(m)
+    end = start.advance(1, 'month')
+
+    ndvi_img_collection_month = modis_ndvi.filterDate(start, end)
+    ndvi_img = ndvi_img_collection_month.mean() if ndvi_img_collection_month.size().getInfo() > 0 else None
+
+    precip_img_collection_month = chirps.filterDate(start, end)
+    precip_img = precip_img_collection_month.sum() if precip_img_collection_month.size().getInfo() > 0 else None
+
+    if soil_moist_coll:
+        soil_img_collection_month = soil_moist_coll.filterDate(start, end)
+        soil_img = soil_img_collection_month.mean() if soil_img_collection_month.size().getInfo() > 0 else None
+    else:
+        soil_img = None
+
+    # Store monthly spatial images
+    month_key = start.format('YYYY-MM-dd').getInfo()
+    monthly_spatial_data[month_key] = {
+        'ndvi_img': ndvi_img,
+        'precip_img': precip_img,
+        'soil_img': soil_img
+    }
+
+
+    # Continue with time series data extraction as before
+    ndvi_mean = ndvi_img.reduceRegion(ee.Reducer.mean(), AOI, SCALE_NDVI).get('NDVI').getInfo() if ndvi_img else None
+    precip_sum = precip_img.reduceRegion(ee.Reducer.mean(), AOI, SCALE_PRECIP).get('precipitation').getInfo() if precip_img else None
+    soil_mean = soil_img.reduceRegion(ee.Reducer.mean(), AOI, SCALE_NDVI).get('sm').getInfo() if soil_img else None
+
+
+    records.append({
+        'date': start.format('YYYY-MM-dd').getInfo(),
+        'ndvi': ndvi_mean,
+        'precip': precip_sum,
+        'soil_moist': soil_mean
+    })
+
+df = pd.DataFrame(records)
+df['date'] = pd.to_datetime(df['date'])
+df = df.sort_values('date').reset_index(drop=True)
+
+# ---------------------- CLIMATOLOGY & INDICES ----------------------
+df['month'] = df['date'].dt.month
+baseline_mask = (df['date'] >= pd.to_datetime(BASELINE_START)) & (df['date'] <= pd.to_datetime(BASELINE_END))
+baseline_stats = df[baseline_mask].groupby('month')['precip'].agg(['mean', 'std']).reset_index().rename(
+    columns={'mean':'precip_mean_baseline','std':'precip_std_baseline'})
+df = df.merge(baseline_stats, on='month', how='left')
+df['spi'] = (df['precip'] - df['precip_mean_baseline']) / df['precip_std_baseline']
+
+ndvi_baseline = df[baseline_mask]
+# Handle potential NaN values in ndvi_baseline before calculating min/max
+ndvi_min = ndvi_baseline['ndvi'].min() if not ndvi_baseline['ndvi'].isnull().all() else 0
+ndvi_max = ndvi_baseline['ndvi'].max() if not ndvi_baseline['ndvi'].isnull().all() else 1
+# Handle division by zero if ndvi_max == ndvi_min
+df['vci'] = (df['ndvi'] - ndvi_min) / (ndvi_max - ndvi_min) if (ndvi_max - ndvi_min) != 0 else np.nan
+
+df['precip_anom'] = df['precip'] - df['precip_mean_baseline']
+df['drought_flag'] = df['vci'].apply(lambda x: 1 if pd.notnull(x) and x < VCI_DROUGHT_THRESHOLD else 0)
+
+for lag in [1,2,3]:
+    df[f'spi_lag_{lag}'] = df['spi'].shift(lag)
+    df[f'precip_lag_{lag}'] = df['precip'].shift(lag)
+    df[f'ndvi_lag_{lag}'] = df['ndvi'].shift(lag)
+
+# Filter model_df to only include data within the analysis period (START_DATE to END_DATE)
+model_df = df[(df['date'] >= pd.to_datetime(START_DATE)) & (df['date'] <= pd.to_datetime(END_DATE))].dropna().reset_index(drop=True)
+
+
+# ---------------------- MODELING ----------------------
+feature_cols = [c for c in model_df.columns if c not in ['date','month','precip_mean_baseline','precip_std_baseline','vci','drought_flag']]
+feature_cols = [c for c in feature_cols if model_df[c].dtype in [np.float64, np.int64, np.float32, np.int32]]
+X = model_df[feature_cols].values
+y = model_df['drought_flag'].values
+
+if X.shape[0] > 0:
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    clf = xgb.XGBClassifier(n_estimators=200, max_depth=4, learning_rate=0.05, use_label_encoder=False, eval_metric='logloss')
+    clf.fit(X_train, y_train)
+    y_pred = clf.predict(X_test)
+    y_proba = clf.predict_proba(X_test)[:,1]
+    print('\nClassification report:')
+    print(classification_report(y_test, y_pred))
+    print('Confusion matrix:\n', confusion_matrix(y_test, y_pred))
+    try:
+        auc = roc_auc_score(y_test, y_proba)
+        print('ROC AUC: {:.3f}'.format(auc))
+    except Exception:
+        pass
+    fi = clf.get_booster().get_score(importance_type='gain')
+    fi_df = pd.DataFrame(list(fi.items()), columns=['feature','gain']).sort_values('gain', ascending=False)
+    joblib.dump(clf, MODEL_PATH)
+    model_df.to_csv(OUTPUT_CSV, index=False)
+    print('Model and dataset saved.')
+
+# ---------------------- VISUALIZATION ----------------------
+sns.set(style="whitegrid")
+
+plt.figure(figsize=(12,5))
+plt.plot(df['date'], df['ndvi'], label='NDVI', color='green')
+plt.title('Monthly NDVI Time Series'); plt.xlabel('Date'); plt.ylabel('NDVI'); plt.legend(); plt.tight_layout(); plt.show()
+
+plt.figure(figsize=(12,5))
+plt.plot(df['date'], df['precip'], label='Precipitation (mm)', color='blue')
+plt.title('Monthly Precipitation Time Series'); plt.xlabel('Date'); plt.ylabel('Precipitation (mm)'); plt.legend(); plt.tight_layout(); plt.show()
+
+if df['soil_moist'].notnull().sum() > 0:
+    plt.figure(figsize=(12,5))
+    plt.plot(df['date'], df['soil_moist'], label='Soil Moisture', color='brown')
+    plt.title('Monthly Soil Moisture Time Series'); plt.xlabel('Date'); plt.ylabel('Soil Moisture'); plt.legend(); plt.tight_layout(); plt.show()
+
+plt.figure(figsize=(12,5))
+plt.plot(df['date'], df['spi'], label='SPI (z-score)', color='purple')
+plt.axhline(0, color='black', linestyle='--')
+plt.title('SPI Time Series'); plt.xlabel('Date'); plt.ylabel('SPI'); plt.legend(); plt.tight_layout(); plt.show()
+
+plt.figure(figsize=(12,5))
+plt.bar(df['date'], df['precip_anom'], label='Rainfall Anomaly', color='skyblue', width=20) # Added width for better visibility of bars
+plt.axhline(0, color='black', linestyle='--')
+plt.title('Monthly Rainfall Anomaly'); plt.xlabel('Date'); plt.ylabel('Anomaly (mm)'); plt.legend(); plt.tight_layout(); plt.show()
+
+plt.figure(figsize=(12,5))
+plt.plot(df['date'], df['vci'], label='VCI', color='orange')
+plt.axhline(VCI_DROUGHT_THRESHOLD, color='red', linestyle='--', label='Drought Threshold')
+plt.title('VCI Time Series'); plt.xlabel('Date'); plt.ylabel('VCI'); plt.legend(); plt.tight_layout(); plt.show()
+
+plt.figure(figsize=(12,4))
+plt.scatter(df['date'], df['drought_flag'], c=df['drought_flag'], cmap='coolwarm', edgecolors='k')
+plt.title('Drought Classification Over Time'); plt.xlabel('Date'); plt.ylabel('Flag'); plt.tight_layout(); plt.show()
+
+# Add model output visualizations
+if X.shape[0] > 0:
+    # Plot predicted probabilities over time for the test set
+    test_dates = model_df.loc[X_test.index, 'date'] # Get dates corresponding to the test set
+    plt.figure(figsize=(12, 5))
+    plt.plot(test_dates, y_proba, label='Predicted Drought Probability', color='teal')
+    plt.axhline(0.5, color='red', linestyle='--', label='Classification Threshold')
+    plt.title('Predicted Drought Probabilities Over Time (Test Set)')
+    plt.xlabel('Date')
+    plt.ylabel('Probability')
+    plt.legend()
+    plt.tight_layout(); plt.show()
+
+    # Plot predicted drought flags over time for the test set
+    plt.figure(figsize=(12, 4))
+    plt.scatter(test_dates, y_pred, c=y_pred, cmap='coolwarm', edgecolors='k')
+    plt.title('Predicted Drought Classification Over Time (Test Set)')
+    plt.xlabel('Date')
+    plt.ylabel('Predicted Flag')
+    plt.tight_layout(); plt.show()
+
+
+    plt.figure(figsize=(6,4))
+    sns.histplot(y_proba, bins=20, kde=True, color='teal')
+    plt.title('Model Predicted Drought Probabilities'); plt.xlabel('Predicted Probability'); plt.ylabel('Count'); plt.tight_layout(); plt.show()
+
+    plt.figure(figsize=(8,5))
+    sns.barplot(x='gain', y='feature', data=fi_df.head(10), palette='viridis')
+    plt.title('Top 10 Features (XGBoost Gain)'); plt.xlabel('Gain'); plt.ylabel('Feature'); plt.tight_layout(); plt.show()
+
+print("Done.")
