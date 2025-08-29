@@ -1,0 +1,109 @@
+# ------------------------------------------------------
+# PART 1: Google Earth Engine Soil Moisture Analysis + Time Series
+# ------------------------------------------------------
+
+import ee
+import geemap
+import matplotlib.pyplot as plt
+import pandas as pd
+
+# Authenticate and initialize Earth Engine
+ee.Authenticate()
+ee.Initialize(project='gee-trial2')
+
+# Define AOI from Earth Engine assets
+aoi = ee.FeatureCollection("projects/gee-trial2/assets/Shapfile/ShapfileShapfile_Chandrapur")
+
+# ---------------------
+# Soil Moisture Collection (2000–2023)
+# ---------------------
+sm = ee.ImageCollection("IDAHO_EPSCOR/TERRACLIMATE") \
+    .select('soil') \
+    .filterDate('2000-01-01', '2023-12-31')
+
+# ---------------------
+# Compute Annual Mean Images
+# ---------------------
+def annual_mean(year):
+    start = ee.Date.fromYMD(year, 1, 1)
+    end = start.advance(1, 'year')
+    image = sm.filterDate(start, end).mean().set({'year': year})
+    return image
+
+years = ee.List.sequence(2000, 2023)
+annual_images = ee.ImageCollection(years.map(lambda y: annual_mean(ee.Number(y))))
+
+# ---------------------
+# Compute Long-Term Mean Image
+# ---------------------
+longterm_mean = annual_images.mean()
+
+# ---------------------
+# Visualization with geemap
+# ---------------------
+soil_vis = {
+    'min': 10,
+    'max': 100,
+    'palette': ['#d7191c', '#fdae61', '#ffffbf', '#a6d96a', '#1a9641']
+}
+
+Map = geemap.Map()
+Map.centerObject(aoi, 8)
+# Map.addLayer(longterm_mean.clip(aoi), soil_vis, 'Soil Moisture Mean (2000–2023)')
+# Map.addLayer(aoi.style(**{'color': 'black', 'fillColor': '00000000'}), {}, 'AOI Boundary')
+Map
+
+# # ---------------------
+# # Reduce each year’s image to mean soil moisture over AOI
+# # ---------------------
+
+def reduce_to_feature(img):
+    stat = img.reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=aoi.geometry(),
+        scale=4000,
+        maxPixels=1e13
+    )
+    return ee.Feature(None, {
+        'year': img.get('year'),
+        'soil_moisture': stat.get('soil')
+    })
+
+# Apply reduction to all annual images
+annual_stats = annual_images.map(reduce_to_feature)
+
+# Convert to Python lists
+years_list = annual_stats.aggregate_array('year').getInfo()
+moisture_list = annual_stats.aggregate_array('soil_moisture').getInfo()
+
+# Create DataFrame and plot
+df = pd.DataFrame({
+    'Year': years_list,
+    'Soil_Moisture': moisture_list
+}).dropna()
+
+# Plot
+plt.figure(figsize=(10, 5))
+plt.plot(df['Year'], df['Soil_Moisture'], marker='o', color='blue')
+plt.title("Annual Soil Moisture Time Series (2000–2023)")
+plt.xlabel("Year")
+plt.ylabel("Soil Moisture")
+plt.grid(True)
+plt.tight_layout()
+plt.savefig("soil_moisture_timeseries.png", dpi=300)
+plt.show()
+
+# # Export soil moisture image to Google Drive
+# export_image = longterm_mean.clip(aoi)
+
+# export_task = ee.batch.Export.image.toDrive(
+#     image=export_image,
+#     description='soil_moisture_mean',
+#     folder='GEE_Exports',
+#     fileNamePrefix='soil_moisture_mean',
+#     region=aoi.geometry(),
+#     scale=4000,
+#     maxPixels=1e13
+# )
+# export_task.start()
+# print("✅ Export task started. Check your Google Drive (GEE_Exports folder) after a few minutes.")
